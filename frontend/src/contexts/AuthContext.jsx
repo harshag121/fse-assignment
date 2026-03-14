@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback } from 'react';
-import { login as apiLogin } from '../services/api';
+import { login as apiLogin, getDoctor, getPatient } from '../services/api';
 
 const AuthContext = createContext(null);
 
@@ -15,7 +15,19 @@ export function AuthProvider({ children }) {
 
   const login = useCallback(async (email, password, role) => {
     const data = await apiLogin(email, password, role);
-    const userObj = { token: data.access_token, role: data.role, id: data.user_id, email };
+    // Fetch user name from the correct endpoint
+    let name = email.split('@')[0];
+    try {
+      if (role === 'doctor') {
+        const doc = await getDoctor(data.user_id);
+        name = doc.name;
+      } else {
+        const pat = await getPatient(data.user_id);
+        name = pat.name;
+      }
+    } catch { /* fall back to email prefix */ }
+
+    const userObj = { token: data.access_token, role: data.role, id: data.user_id, email, name };
     localStorage.setItem('token', data.access_token);
     localStorage.setItem('user', JSON.stringify(userObj));
     setUser(userObj);
