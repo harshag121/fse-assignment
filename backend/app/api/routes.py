@@ -180,12 +180,25 @@ async def chat(
     session_id = payload.session_id or str(uuid.uuid4())
     user_id = payload.user_id or (int(current_user["sub"]) if current_user else None)
 
-    result = await llm_service.chat(
-        session_id=session_id,
-        user_message=payload.message,
-        role=payload.role,
-        user_id=user_id,
-    )
+    try:
+        result = await llm_service.chat(
+            session_id=session_id,
+            user_message=payload.message,
+            role=payload.role,
+            user_id=user_id,
+        )
+    except Exception as e:
+        err = str(e)
+        if "insufficient_quota" in err or "quota" in err.lower():
+            detail = "OpenAI quota exceeded. Please add credits at platform.openai.com/settings/billing"
+        elif "rate_limit" in err.lower():
+            detail = "OpenAI rate limit hit. Please wait a moment and try again."
+        elif "invalid_api_key" in err.lower():
+            detail = "Invalid OpenAI API key. Please check your OPENAI_API_KEY in .env"
+        else:
+            detail = f"AI service error: {err}"
+        raise HTTPException(status_code=503, detail=detail)
+
     return ChatResponse(session_id=session_id, **result)
 
 

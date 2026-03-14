@@ -21,7 +21,8 @@ def create_mcp_server() -> Server:
 
 
 def create_mcp_starlette_app(mcp_server: Server) -> Starlette:
-    """Wrap the MCP server in a Starlette app via SSE transport."""
+    """Wrap the MCP server in a Starlette app via SSE transport.
+    This app is mounted at /mcp in main.py, so paths here are relative to that."""
     sse = SseServerTransport("/mcp/messages/")
 
     async def handle_sse(request: Request):
@@ -36,7 +37,7 @@ def create_mcp_starlette_app(mcp_server: Server) -> Starlette:
 
     return Starlette(
         routes=[
-            Route("/mcp/sse", endpoint=handle_sse),
-            Mount("/mcp/messages/", app=sse.handle_post_message),
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
         ]
     )

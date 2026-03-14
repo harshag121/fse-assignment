@@ -7,8 +7,6 @@ import {
 } from 'recharts';
 import styles from './DoctorDashboard.module.css';
 
-const DATE_FILTERS = ['today', 'yesterday', 'this_week', 'last_week'];
-
 const STATUS_COLORS = {
   confirmed: '#16a34a',
   pending:   '#d97706',
@@ -23,7 +21,6 @@ export default function DoctorDashboard() {
   const [reportQuery, setReportQuery] = useState('');
   const [reportResult, setReportResult] = useState('');
   const [reportLoading, setReportLoading] = useState(false);
-  const [dateFilter] = useState('today');
 
   useEffect(() => {
     if (!user?.id) return;

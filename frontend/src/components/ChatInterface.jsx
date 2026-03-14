@@ -68,10 +68,8 @@ export default function ChatInterface() {
         tools_called: res.tool_calls_made,
       });
     } catch (err) {
-      addMessage({
-        role: 'assistant',
-        content: '⚠️ Sorry, something went wrong. Please try again.',
-      });
+      const detail = err?.response?.data?.detail || 'Something went wrong. Please try again.';
+      addMessage({ role: 'assistant', content: `⚠️ ${detail}` });
     } finally {
       setLoading(false);
     }

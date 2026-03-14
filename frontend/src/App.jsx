@@ -3,7 +3,7 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { SessionProvider } from './contexts/SessionContext';
 import ChatInterface from './components/ChatInterface';
 import DoctorDashboard from './components/DoctorDashboard';
-import { login as apiLogin, createPatient, createDoctor } from './services/api';
+import { createPatient, createDoctor } from './services/api';
 import './App.css';
 
 // ── Login Page ────────────────────────────────────────────────────────────────

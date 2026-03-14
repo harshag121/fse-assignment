@@ -1,7 +1,7 @@
 # Core
 fastapi==0.115.5
 uvicorn[standard]==0.32.0
-pydantic==2.9.2
+pydantic[email]==2.9.2
 pydantic-settings==2.6.1
 
 # MCP
@@ -15,6 +15,7 @@ alembic==1.14.0
 # Auth
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 
 # HTTP client
 httpx==0.27.2
@@ -24,8 +25,7 @@ google-auth==2.35.0
 google-auth-oauthlib==1.2.1
 google-api-python-client==2.153.0
 
-# Email
-sendgrid==6.11.0
+# Email — uses stdlib smtplib (Gmail SMTP), no extra package needed
 
 # Notifications
 slack-sdk==3.33.4

@@ -22,9 +22,9 @@ class Settings(BaseSettings):
     # Google Calendar
     GOOGLE_CREDENTIALS_JSON: Optional[str] = None
 
-    # Email (SendGrid)
-    SENDGRID_API_KEY: Optional[str] = None
-    FROM_EMAIL: str = "noreply@docassistant.com"
+    # Email (Gmail SMTP)
+    GMAIL_ADDRESS: Optional[str] = None
+    GMAIL_APP_PASSWORD: Optional[str] = None
 
     # Notifications
     SLACK_BOT_TOKEN: Optional[str] = None

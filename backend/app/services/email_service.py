@@ -1,5 +1,9 @@
-"""Email confirmation service using SendGrid."""
-from typing import Optional
+"""Email service using Gmail SMTP (smtplib — no third-party SDK needed)."""
+import smtplib
+import asyncio
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
 from app.core.config import settings
 
 
@@ -35,8 +39,20 @@ CALENDAR_ROW = """
 
 class EmailService:
     def __init__(self):
-        if not settings.SENDGRID_API_KEY:
-            raise RuntimeError("SENDGRID_API_KEY not configured")
+        if not settings.GMAIL_ADDRESS or not settings.GMAIL_APP_PASSWORD:
+            raise RuntimeError("GMAIL_ADDRESS and GMAIL_APP_PASSWORD must be configured")
+
+    def _send_smtp(self, to_email: str, subject: str, html_body: str) -> str:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = settings.GMAIL_ADDRESS
+        msg["To"]      = to_email
+        msg.attach(MIMEText(html_body, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(settings.GMAIL_ADDRESS, settings.GMAIL_APP_PASSWORD)
+            server.sendmail(settings.GMAIL_ADDRESS, to_email, msg.as_string())
+        return "sent"
 
     async def send_appointment_confirmation(
         self,
@@ -44,55 +60,25 @@ class EmailService:
         patient_name: str,
         details: dict,
     ) -> str:
-        """Send HTML confirmation email. Returns message ID."""
-        import asyncio
-        from sendgrid import SendGridAPIClient
-        from sendgrid.helpers.mail import Mail
-
         cal_row = ""
         if details.get("google_calendar_link"):
             cal_row = CALENDAR_ROW.format(link=details["google_calendar_link"])
 
-        html_content = CONFIRMATION_HTML.format(
+        html_body = CONFIRMATION_HTML.format(
             patient_name=patient_name,
             doctor_name=details.get("doctor_name", "your doctor"),
             start_time=details.get("start_time", ""),
             calendar_row=cal_row,
         )
 
-        message = Mail(
-            from_email=settings.FROM_EMAIL,
-            to_emails=to_email,
-            subject="Your Appointment is Confirmed",
-            html_content=html_content,
-        )
-
-        def _send():
-            sg = SendGridAPIClient(settings.SENDGRID_API_KEY)
-            response = sg.send(message)
-            headers = dict(response.headers)
-            return headers.get("X-Message-Id", "sent")
-
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _send)
+        return await loop.run_in_executor(
+            None, self._send_smtp, to_email, "Your Appointment is Confirmed", html_body
+        )
 
     async def send_generic(self, to_email: str, subject: str, body: str) -> str:
-        """Send a plain-text email."""
-        import asyncio
-        from sendgrid import SendGridAPIClient
-        from sendgrid.helpers.mail import Mail
-
-        message = Mail(
-            from_email=settings.FROM_EMAIL,
-            to_emails=to_email,
-            subject=subject,
-            plain_text_content=body,
-        )
-
-        def _send():
-            sg = SendGridAPIClient(settings.SENDGRID_API_KEY)
-            response = sg.send(message)
-            return dict(response.headers).get("X-Message-Id", "sent")
-
+        html_body = f"<pre style='font-family:Arial,sans-serif'>{body}</pre>"
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _send)
+        return await loop.run_in_executor(
+            None, self._send_smtp, to_email, subject, html_body
+        )

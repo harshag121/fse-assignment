@@ -39,14 +39,14 @@ def create_app() -> FastAPI:
     # REST API routes
     app.include_router(router, prefix="/api")
 
-    # Mount MCP server (SSE transport)
-    mcp_server = create_mcp_server()
-    mcp_app = create_mcp_starlette_app(mcp_server)
-    app.mount("/", mcp_app)
-
     @app.get("/health", tags=["health"])
     async def health():
         return {"status": "ok", "app": settings.APP_NAME}
+
+    # Mount MCP server at /mcp — keeps it isolated from FastAPI routes
+    mcp_server = create_mcp_server()
+    mcp_app = create_mcp_starlette_app(mcp_server)
+    app.mount("/mcp", mcp_app)
 
     return app
 
