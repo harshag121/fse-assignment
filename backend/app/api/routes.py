@@ -180,10 +180,16 @@ async def chat(
     session_id = payload.session_id or str(uuid.uuid4())
     user_id = payload.user_id or (int(current_user["sub"]) if current_user else None)
 
+    # Inject user identity so the LLM can pass the correct ID to tools
+    if user_id and payload.role == "patient":
+        enriched_message = f"[My patient_id is {user_id}] {payload.message}"
+    else:
+        enriched_message = payload.message
+
     try:
         result = await llm_service.chat(
             session_id=session_id,
-            user_message=payload.message,
+            user_message=enriched_message,
             role=payload.role,
             user_id=user_id,
         )
