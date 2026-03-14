@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     GMAIL_ADDRESS: Optional[str] = None
     GMAIL_APP_PASSWORD: Optional[str] = None
 
+    # Frontend
+    FRONTEND_URL: Optional[str] = None  # e.g. https://my-app.up.railway.app
+
     # Notifications
     SLACK_BOT_TOKEN: Optional[str] = None
     SLACK_DEFAULT_CHANNEL: str = "#doctor-reports"
