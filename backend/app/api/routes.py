@@ -196,11 +196,11 @@ async def chat(
     except Exception as e:
         err = str(e)
         if "insufficient_quota" in err or "quota" in err.lower():
-            detail = "OpenAI quota exceeded. Please add credits at platform.openai.com/settings/billing"
+            detail = "LLM quota exceeded. Please check your Groq API key usage."
         elif "rate_limit" in err.lower():
-            detail = "OpenAI rate limit hit. Please wait a moment and try again."
+            detail = "LLM rate limit hit. Please wait a moment and try again."
         elif "invalid_api_key" in err.lower():
-            detail = "Invalid OpenAI API key. Please check your OPENAI_API_KEY in .env"
+            detail = "Invalid API key. Please check your GROQ_API_KEY in .env"
         else:
             detail = f"AI service error: {err}"
         raise HTTPException(status_code=503, detail=detail)
