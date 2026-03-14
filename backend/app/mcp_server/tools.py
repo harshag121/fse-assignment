@@ -86,12 +86,10 @@ def register_tools(server: Server):
                     "properties": {
                         "to_email": {"type": "string"},
                         "patient_name": {"type": "string"},
-                        "appointment_details": {
-                            "type": "object",
-                            "description": "Dict with doctor_name, start_time, end_time, notes",
-                        },
+                        "doctor_name": {"type": "string"},
+                        "appointment_datetime": {"type": "string", "description": "ISO datetime, e.g. 2026-03-16T10:00:00"},
                     },
-                    "required": ["to_email", "patient_name", "appointment_details"],
+                    "required": ["to_email", "patient_name", "doctor_name", "appointment_datetime"],
                 },
             ),
             Tool(
@@ -315,9 +313,14 @@ async def _book_appointment(
 async def _send_email_confirmation(
     to_email: str,
     patient_name: str,
-    appointment_details: dict,
+    doctor_name: str,
+    appointment_datetime: str,
 ):
     from app.services.email_service import EmailService
+    appointment_details = {
+        "doctor_name": doctor_name,
+        "appointment_datetime": appointment_datetime,
+    }
     try:
         svc = EmailService()
         result = await svc.send_appointment_confirmation(

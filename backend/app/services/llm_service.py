@@ -62,9 +62,10 @@ OPENAI_TOOLS = [
                 "properties": {
                     "to_email": {"type": "string"},
                     "patient_name": {"type": "string"},
-                    "appointment_details": {"type": "object"},
+                    "doctor_name": {"type": "string"},
+                    "appointment_datetime": {"type": "string", "description": "ISO datetime, e.g. 2026-03-16T10:00:00"},
                 },
-                "required": ["to_email", "patient_name", "appointment_details"],
+                "required": ["to_email", "patient_name", "doctor_name", "appointment_datetime"],
             },
         },
     },
