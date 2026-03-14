@@ -227,9 +227,11 @@ async def get_chat_history(session_id: str, db: AsyncSession = Depends(get_db)):
 async def generate_report(payload: ReportRequest):
     """Natural-language report query for a doctor."""
     session_id = payload.session_id or str(uuid.uuid4())
+    # Prefix doctor_id so the model knows which ID to pass to query_appointments_stats
+    enriched_query = f"[My doctor_id is {payload.doctor_id}] {payload.query}"
     result = await llm_service.chat(
         session_id=session_id,
-        user_message=payload.query,
+        user_message=enriched_query,
         role="doctor",
         user_id=payload.doctor_id,
     )

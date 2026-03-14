@@ -14,10 +14,10 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://postgres:password@localhost:5432/docappointment"
 
-    # LLM
+    # LLM — Groq (primary, free) or OpenAI fallback
+    GROQ_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
-    ANTHROPIC_API_KEY: Optional[str] = None
-    LLM_MODEL: str = "gpt-4o"
+    LLM_MODEL: str = "llama-3.3-70b-versatile"
 
     # Google Calendar
     GOOGLE_CREDENTIALS_JSON: Optional[str] = None

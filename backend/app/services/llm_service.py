@@ -43,8 +43,8 @@ OPENAI_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "doctor_id": {"type": "integer"},
-                    "patient_id": {"type": "integer"},
+                    "doctor_id": {"type": "string", "description": "integer doctor ID"},
+                    "patient_id": {"type": "string", "description": "integer patient ID"},
                     "datetime": {"type": "string", "description": "ISO 8601"},
                     "symptoms": {"type": "string"},
                 },
@@ -76,7 +76,7 @@ OPENAI_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "doctor_id": {"type": "integer"},
+                    "doctor_id": {"type": "string", "description": "integer doctor ID"},
                     "date_range": {
                         "type": "string",
                         "enum": ["yesterday", "today", "tomorrow", "this_week", "last_week", "custom"],
@@ -93,13 +93,12 @@ OPENAI_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_doctor_notification",
-            "description": "Send a summary report to a doctor via Slack or WhatsApp.",
+            "description": "Send a summary report to a doctor via Slack.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "doctor_id": {"type": "integer"},
+                    "doctor_id": {"type": "string", "description": "integer doctor ID"},
                     "message": {"type": "string"},
-                    "channel": {"type": "string"},
                 },
                 "required": ["doctor_id", "message"],
             },
@@ -113,7 +112,7 @@ OPENAI_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "doctor_id": {"type": "integer"},
+                    "doctor_id": {"type": "string", "description": "integer doctor ID"},
                     "preferred_date": {"type": "string", "description": "YYYY-MM-DD"},
                     "symptoms": {"type": "string"},
                 },
@@ -132,26 +131,45 @@ TOOL_HANDLERS = {
     "auto_reschedule": _auto_reschedule,
 }
 
-SYSTEM_PATIENT = (
-    "You are a warm, professional medical appointment assistant.\n"
-    "Rules:\n"
-    "1. Always call check_doctor_availability BEFORE booking.\n"
-    "2. After booking, always call send_email_confirmation.\n"
-    "3. If the slot is taken, call auto_reschedule.\n"
-    "4. Never invent data – only use tool results.\n"
-    "5. Maintain context across the conversation (doctor, date, time chosen).\n"
-    "6. Be concise and friendly. Confirm details before finalising."
-)
+# Integer fields per tool — coerce strings to int (Groq sometimes serialises ints as strings)
+_INT_FIELDS: dict[str, list[str]] = {
+    "book_appointment": ["doctor_id", "patient_id"],
+    "query_appointments_stats": ["doctor_id"],
+    "send_doctor_notification": ["doctor_id"],
+    "auto_reschedule": ["doctor_id"],
+}
 
-SYSTEM_DOCTOR = (
-    "You are a precise medical practice analytics assistant.\n"
-    "Rules:\n"
-    "1. Always use query_appointments_stats to get real data.\n"
-    "2. After fetching stats, present a clear bullet-point summary.\n"
-    "3. When asked to send a report, call send_doctor_notification with the summary.\n"
-    "4. Support ranges: today, yesterday, this_week, last_week, custom.\n"
-    "5. Be concise and professional."
-)
+def _system_patient() -> str:
+    from datetime import date
+    today = date.today()
+    return (
+        f"You are a warm, professional medical appointment assistant.\n"
+        f"TODAY'S DATE IS: {today.strftime('%Y-%m-%d')} ({today.strftime('%A, %d %B %Y')}). "
+        f"Always use this when interpreting 'today', 'tomorrow', 'this week', etc.\n"
+        "Rules:\n"
+        "1. Always call check_doctor_availability BEFORE booking.\n"
+        "2. After booking, always call send_email_confirmation.\n"
+        "3. If the slot is taken, call auto_reschedule.\n"
+        "4. Never invent data – only use tool results.\n"
+        "5. Maintain context across the conversation (doctor, date, time chosen).\n"
+        "6. Be concise and friendly. Confirm details before finalising."
+    )
+
+
+def _system_doctor() -> str:
+    from datetime import date
+    today = date.today()
+    return (
+        f"You are a precise medical practice analytics assistant.\n"
+        f"TODAY'S DATE IS: {today.strftime('%Y-%m-%d')} ({today.strftime('%A, %d %B %Y')}). "
+        f"Always use this when interpreting 'today', 'yesterday', 'this week', etc.\n"
+        "Rules:\n"
+        "1. Always use query_appointments_stats to get real data.\n"
+        "2. After fetching stats, present a clear bullet-point summary.\n"
+        "3. When asked to send a report, call send_doctor_notification with the summary.\n"
+        "4. Support ranges: today, yesterday, this_week, last_week, custom.\n"
+        "5. Be concise and professional."
+    )
 
 
 class LLMService:
@@ -162,7 +180,14 @@ class LLMService:
         if self.client:
             return self.client
         from openai import AsyncOpenAI
-        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        if settings.GROQ_API_KEY:
+            # Groq is OpenAI-compatible — just swap base_url and key
+            self.client = AsyncOpenAI(
+                api_key=settings.GROQ_API_KEY,
+                base_url="https://api.groq.com/openai/v1",
+            )
+        else:
+            self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         return self.client
 
     async def _load_history(self, session_id: str, limit: int = 10) -> list[dict]:
@@ -170,18 +195,14 @@ class LLMService:
             result = await db.execute(
                 select(Conversation)
                 .where(Conversation.session_id == session_id)
+                .where(Conversation.role.in_(["user", "assistant"]))
                 .order_by(Conversation.timestamp.desc())
                 .limit(limit)
             )
             rows = result.scalars().all()
             rows.reverse()
-            messages = []
-            for row in rows:
-                msg: dict = {"role": row.role, "content": row.content}
-                if row.tool_calls:
-                    msg["tool_calls"] = json.loads(row.tool_calls)
-                messages.append(msg)
-            return messages
+            # Only return role + content — strip tool_calls to avoid format issues
+            return [{"role": row.role, "content": row.content or ""} for row in rows]
 
     async def _save_message(
         self,
@@ -218,7 +239,7 @@ class LLMService:
         # Persist user message
         await self._save_message(session_id, user_id, "user", user_message)
 
-        system_prompt = SYSTEM_DOCTOR if role == "doctor" else SYSTEM_PATIENT
+        system_prompt = _system_doctor() if role == "doctor" else _system_patient()
         messages = [{"role": "system", "content": system_prompt}] + history + [
             {"role": "user", "content": user_message}
         ]
@@ -253,6 +274,13 @@ class LLMService:
             for tc in msg.tool_calls:
                 fn_name = tc.function.name
                 fn_args = json.loads(tc.function.arguments)
+                # Coerce integer fields that Groq may serialize as strings
+                for field in _INT_FIELDS.get(fn_name, []):
+                    if field in fn_args and isinstance(fn_args[field], str):
+                        try:
+                            fn_args[field] = int(fn_args[field])
+                        except ValueError:
+                            pass
                 tools_called.append(fn_name)
 
                 handler = TOOL_HANDLERS.get(fn_name)
