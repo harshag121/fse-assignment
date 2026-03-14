@@ -235,10 +235,18 @@ async def generate_report(payload: ReportRequest):
     session_id = payload.session_id or str(uuid.uuid4())
     # Prefix doctor_id so the model knows which ID to pass to query_appointments_stats
     enriched_query = f"[My doctor_id is {payload.doctor_id}] {payload.query}"
-    result = await llm_service.chat(
-        session_id=session_id,
-        user_message=enriched_query,
-        role="doctor",
-        user_id=payload.doctor_id,
-    )
+    try:
+        result = await llm_service.chat(
+            session_id=session_id,
+            user_message=enriched_query,
+            role="doctor",
+            user_id=payload.doctor_id,
+        )
+    except Exception as e:
+        err = str(e)
+        if "rate_limit" in err.lower():
+            detail = "LLM rate limit hit. Please wait a moment and try again."
+        else:
+            detail = f"AI service error: {err}"
+        raise HTTPException(status_code=503, detail=detail)
     return {"session_id": session_id, **result}
