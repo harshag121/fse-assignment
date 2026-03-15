@@ -153,7 +153,10 @@ def _system_patient() -> str:
         "3. If the slot is taken, call auto_reschedule.\n"
         "4. Never invent data – only use tool results.\n"
         "5. Maintain context across the conversation (doctor, date, time chosen).\n"
-        "6. Be concise and friendly. Confirm details before finalising."
+        "6. Be concise and friendly. Confirm details before finalising.\n"
+        "7. CRITICAL: doctor_id and patient_id must be plain integers (e.g. 1, 2). "
+        "Get the doctor_id from check_doctor_availability results. "
+        "NEVER use a variable name, function name, or placeholder as an ID."
     )
 
 
@@ -276,28 +279,37 @@ class LLMService:
                 fn_name = tc.function.name
                 fn_args = json.loads(tc.function.arguments)
                 # Coerce integer fields that Groq may serialize as strings
+                coerce_error = None
                 for field in _INT_FIELDS.get(fn_name, []):
-                    if field in fn_args and isinstance(fn_args[field], str):
+                    if field in fn_args and not isinstance(fn_args[field], int):
                         try:
                             fn_args[field] = int(fn_args[field])
-                        except ValueError:
-                            pass
+                        except (ValueError, TypeError):
+                            coerce_error = (
+                                f"Invalid value for '{field}': expected a plain integer ID "
+                                f"(e.g. 1), got '{fn_args[field]}'. "
+                                f"Use the actual numeric ID from previous tool results."
+                            )
+                            break
                 tools_called.append(fn_name)
 
-                handler = TOOL_HANDLERS.get(fn_name)
-                if handler:
-                    result_contents = await handler(**fn_args)
-                    result_text = result_contents[0].text if result_contents else "{}"
-
-                    # Track appointment IDs
-                    try:
-                        parsed = json.loads(result_text)
-                        if isinstance(parsed, dict) and "appointment_id" in parsed:
-                            appointments_affected.append(parsed["appointment_id"])
-                    except Exception:
-                        pass
+                if coerce_error:
+                    result_text = json.dumps({"error": coerce_error})
                 else:
-                    result_text = json.dumps({"error": f"Unknown tool: {fn_name}"})
+                    handler = TOOL_HANDLERS.get(fn_name)
+                    if handler:
+                        result_contents = await handler(**fn_args)
+                        result_text = result_contents[0].text if result_contents else "{}"
+
+                        # Track appointment IDs
+                        try:
+                            parsed = json.loads(result_text)
+                            if isinstance(parsed, dict) and "appointment_id" in parsed:
+                                appointments_affected.append(parsed["appointment_id"])
+                        except Exception:
+                            pass
+                    else:
+                        result_text = json.dumps({"error": f"Unknown tool: {fn_name}"})
 
                 messages.append({
                     "role": "tool",
