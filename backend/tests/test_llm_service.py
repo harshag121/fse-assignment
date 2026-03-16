@@ -73,6 +73,26 @@ def _response_with_text(text: str):
 
 
 class LLMServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rate_limited_primary_model_falls_back_to_8b(self):
+        service = LLMService()
+
+        async def create_completion(**kwargs):
+            if kwargs["model"] == "llama-3.3-70b-versatile":
+                raise RuntimeError("429 rate_limit_exceeded")
+            return _response_with_text("Fallback model worked.")
+
+        fake_openai = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
+
+        with mock.patch("app.services.llm_service.settings.LLM_MODEL", "llama-3.3-70b-versatile"), \
+             mock.patch("app.services.llm_service.settings.GROQ_API_KEY", "gsk_test"):
+            response = await service._create_completion(
+                fake_openai,
+                messages=[{"role": "user", "content": "hello"}],
+                tools=[],
+            )
+
+        self.assertEqual(response.choices[0].message.content, "Fallback model worked.")
+
     async def test_invalid_tool_json_becomes_recoverable_tool_error(self):
         service = LLMService()
         completions = mock.AsyncMock(side_effect=[

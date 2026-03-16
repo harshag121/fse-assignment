@@ -131,6 +131,36 @@ class LLMService:
             self._openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         return self._openai_client
 
+    def _candidate_models(self) -> list[str]:
+        models = [settings.LLM_MODEL]
+        # Groq free tier commonly rate-limits the larger 70B model; keep a cheap
+        # tool-capable fallback ready so agentic flows still complete.
+        if settings.GROQ_API_KEY and "llama-3.1-8b-instant" not in models:
+            models.append("llama-3.1-8b-instant")
+        return models
+
+    async def _create_completion(self, openai, messages: list[dict], tools: list[dict]):
+        last_exc = None
+        for model_name in self._candidate_models():
+            try:
+                return await openai.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                )
+            except Exception as exc:
+                raw = str(exc).lower()
+                is_rate_limited = "rate_limit" in raw or "rate limit" in raw or "429" in raw
+                if not is_rate_limited:
+                    raise
+                last_exc = exc
+
+        raise RuntimeError(
+            "Groq rate limit exceeded for all configured models. "
+            "Try again in a few minutes or switch to a lower-cost model."
+        ) from last_exc
+
     async def _load_history(self, session_id: str, limit: int = 10) -> list[dict]:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -191,12 +221,7 @@ class LLMService:
                         openai_tools = [_mcp_tool_to_openai(t) for t in tools_result.tools]
 
                         for _ in range(10):
-                            response = await openai.chat.completions.create(
-                                model=settings.LLM_MODEL,
-                                messages=messages,
-                                tools=openai_tools,
-                                tool_choice="auto",
-                            )
+                            response = await self._create_completion(openai, messages, openai_tools)
                             msg = response.choices[0].message
 
                             if not msg.tool_calls:
@@ -260,6 +285,7 @@ class LLMService:
                                 messages.append({
                                     "role": "tool",
                                     "tool_call_id": tc.id,
+                                    "name": fn_name,
                                     "content": result_text,
                                 })
 

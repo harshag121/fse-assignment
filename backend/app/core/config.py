@@ -17,7 +17,8 @@ class Settings(BaseSettings):
     # LLM — Groq (primary, free) or OpenAI fallback
     GROQ_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
-    LLM_MODEL: str = "llama-3.3-70b-versatile"
+    # Default to a cheaper Groq production model that still supports tool use well.
+    LLM_MODEL: str = "llama-3.1-8b-instant"
 
     # Google Calendar
     GOOGLE_CREDENTIALS_JSON: Optional[str] = None
