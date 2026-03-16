@@ -17,8 +17,10 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── FastAPI Backend ─────────────────────────────────────────────────────────
-  backend:
+  # ── MCP Server (port 8001) ───────────────────────────────────────────────────
+  # This is the MCP *server* process. It exposes tools via the MCP protocol
+  # over SSE. The backend connects to it as an MCP *client*.
+  mcp-server:
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -27,10 +29,34 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://docuser:docpass@db:5432/docappointment
     ports:
+      - "8001:8001"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: python mcp_server_main.py
+
+  # ── FastAPI Backend / MCP Client (port 8000) ────────────────────────────────
+  # This process acts as the MCP *client*: it connects to mcp-server:8001
+  # to discover and invoke tools dynamically via the MCP protocol.
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://docuser:docpass@db:5432/docappointment
+      # Point the MCP client at the mcp-server container
+      MCP_SERVER_URL: http://mcp-server:8001/sse
+    ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
+      mcp-server:
+        condition: service_started
     volumes:
       - ./backend:/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

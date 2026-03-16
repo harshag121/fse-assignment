@@ -1,33 +1,72 @@
-# Smart Doctor Appointment & Reporting Assistant with MCP
+# Smart Doctor Appointment & Reporting Assistant (MCP)
 
-A full-stack agentic AI application that uses the **Model Context Protocol (MCP)** for dynamic tool discovery and orchestration. Patients can book appointments through natural language; doctors can query statistics and receive reports via Slack or WhatsApp.
+A full-stack agentic AI application built on the **Model Context Protocol (MCP)** — Anthropic's open standard for connecting AI applications to external tools and data sources. Patients book appointments through natural language; doctors query statistics and receive reports via Slack.
 
 ---
 
-## Architecture
+## Proper MCP Architecture
+
+This application implements a **true MCP client–server separation** across two independent processes:
 
 ```
-React Frontend (port 3000)
-       │  REST / JSON
-       ▼
-FastAPI Backend (port 8000)
-       │
-       ├── /api/*       ← REST routes (auth, doctors, patients, chat, reports)
-       ├── /mcp/sse     ← MCP Server (SSE transport)
-       │       ├── Tools     (check_availability, book_appointment, …)
-       │       ├── Resources (doctors://*, appointments://*)
-       │       └── Prompts   (booking_assistant, report_assistant)
-       │
-       ├── LLM Service  ← OpenAI function-calling agentic loop
-       └── Services     ← Calendar, Email, Notification
-               │
-PostgreSQL 15
+┌─────────────────────────────────────────────────────────────────┐
+│                      Docker Network                              │
+│                                                                  │
+│  ┌──────────────────┐   MCP protocol (SSE)   ┌───────────────┐  │
+│  │                  │  ──────────────────────►│               │  │
+│  │  FastAPI Backend │   GET  /sse             │  MCP Server   │  │
+│  │  (port 8000)     │   POST /messages/       │  (port 8001)  │  │
+│  │                  │◄────────────────────────│               │  │
+│  │  MCP *Client*    │   tool results via SSE  │  MCP *Server* │  │
+│  └──────────────────┘                         └───────────────┘  │
+│          ▲                                            │           │
+│          │ REST/JSON                                 │ SQL       │
+│          │                                           ▼           │
+│  ┌───────────────┐                          ┌────────────────┐   │
+│  │ React / Node  │                          │  PostgreSQL 15 │   │
+│  │  (port 3000)  │                          │  (port 5432)   │   │
+│  └───────────────┘                          └────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### MCP Client–Server–Tool pattern
-- **MCP Server** (`app/mcp_server/`) exposes six tools, two resource URIs, and two prompt templates via SSE transport.
-- **MCP Client** is the `LLMService` which dynamically selects and chains tools based on user intent, without hardcoded workflows.
-- **Tools** are independently callable by the LLM and also importable by the REST API layer for direct invocation.
+### How the MCP protocol is used
+
+**MCP Server** (`backend/mcp_server_main.py`) — standalone process on port 8001:
+- Exposes 6 tools, 2 resource URIs, and 2 prompts via the MCP SSE transport
+- Any MCP-compatible client can connect to it independently
+- Registers tools with `@server.list_tools()` and `@server.call_tool()`
+
+**MCP Client** (`backend/app/services/llm_service.py`) — lives inside the FastAPI process:
+- Opens a real SSE connection to the MCP server at `http://mcp-server:8001/sse`
+- Calls `session.list_tools()` — **dynamic discovery** at runtime, zero hardcoded schemas
+- Passes tools to the LLM (Groq) in OpenAI function-calling format
+- When the LLM requests a tool, calls `session.call_tool(name, args)` — **protocol-based invocation**, no direct Python function calls
+- One MCP session is held open for the entire agentic loop per chat turn
+
+```python
+# llm_service.py — the key pattern
+async with sse_client(settings.MCP_SERVER_URL) as (read, write):
+    async with ClientSession(read, write) as mcp_session:
+
+        await mcp_session.initialize()                    # MCP handshake
+
+        tools = await mcp_session.list_tools()            # dynamic discovery
+        openai_tools = [mcp_tool_to_openai(t) for t in tools.tools]
+
+        # ... LLM agentic loop ...
+        result = await mcp_session.call_tool(name, args)  # protocol invocation
+```
+
+### What was wrong before (and how it's fixed)
+
+The previous version had the MCP server running but the LLM service completely bypassed it — it hardcoded tool schemas in a Python list and called tool functions directly as Python imports. **No MCP protocol was used.** The fix:
+
+| Before (broken) | After (correct) |
+|---|---|
+| `OPENAI_TOOLS = [...]` hardcoded in llm_service.py | `session.list_tools()` — discovered from server at runtime |
+| `handler = TOOL_HANDLERS[name]; await handler(**args)` | `session.call_tool(name, args)` — invoked through SSE protocol |
+| MCP server mounted inside FastAPI (`/mcp/sse`) | MCP server runs as a **separate process** on port 8001 |
+| LLM service never connects to MCP server | LLM service connects via `sse_client` + `ClientSession` |
 
 ---
 
@@ -36,43 +75,42 @@ PostgreSQL 15
 ```
 doctor-appointment-mcp/
 ├── backend/
+│   ├── mcp_server_main.py          ← Standalone MCP SERVER (port 8001)
 │   ├── app/
+│   │   ├── main.py                 ← FastAPI app — pure REST API + MCP CLIENT
 │   │   ├── mcp_server/
-│   │   │   ├── server.py       # MCP server init + SSE mount
-│   │   │   ├── tools.py        # All 6 MCP tools
-│   │   │   ├── resources.py    # doctors:// + appointments:// URIs
-│   │   │   └── prompts.py      # Booking + report system prompts
+│   │   │   ├── tools.py            ← 6 tool handlers (called by MCP server)
+│   │   │   ├── resources.py        ← doctors:// + appointments:// URIs
+│   │   │   └── prompts.py          ← Booking + report system prompts
 │   │   ├── api/
-│   │   │   ├── routes.py       # FastAPI REST endpoints
+│   │   │   ├── routes.py           ← REST endpoints (auth, chat, reports …)
 │   │   │   └── dependencies.py
 │   │   ├── services/
-│   │   │   ├── calendar_service.py    # Google Calendar
-│   │   │   ├── email_service.py       # SendGrid
-│   │   │   ├── notification_service.py # Slack + Twilio WhatsApp
-│   │   │   └── llm_service.py         # Agentic LLM loop
+│   │   │   ├── llm_service.py      ← MCP CLIENT — sse_client + ClientSession
+│   │   │   ├── calendar_service.py ← Google Calendar integration
+│   │   │   ├── email_service.py    ← Gmail SMTP
+│   │   │   └── notification_service.py ← Slack notifications
 │   │   ├── models/
-│   │   │   ├── database.py    # SQLAlchemy async models
-│   │   │   └── schemas.py     # Pydantic request/response schemas
-│   │   ├── core/
-│   │   │   ├── config.py      # Pydantic settings
-│   │   │   └── security.py    # JWT helpers
-│   │   └── main.py            # FastAPI app factory
+│   │   │   ├── database.py         ← SQLAlchemy async models
+│   │   │   └── schemas.py          ← Pydantic schemas
+│   │   └── core/
+│   │       ├── config.py           ← Settings (incl. MCP_SERVER_URL)
+│   │       └── security.py         ← JWT helpers
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── frontend/
 │   ├── src/
 │   │   ├── components/
-│   │   │   ├── ChatInterface.jsx        # AI chat UI
-│   │   │   ├── DoctorDashboard.jsx      # Stats + report generator
-│   │   │   └── AppointmentCard.jsx      # Single appointment card
-│   │   ├── contexts/
-│   │   │   ├── AuthContext.jsx          # JWT auth state
-│   │   │   └── SessionContext.jsx       # Conversation session
-│   │   ├── services/api.js              # Axios API wrapper
-│   │   ├── App.jsx                      # Routing + layout
-│   │   └── index.js
+│   │   │   ├── LandingPage.jsx         ← Role selection (patient / doctor)
+│   │   │   ├── ChatInterface.jsx       ← AI chat with tool pill indicators
+│   │   │   ├── DoctorDashboard.jsx     ← Analytics charts (Recharts)
+│   │   │   └── NlReportGenerator.jsx  ← Natural-language report generator
+│   │   ├── contexts/AuthContext.jsx    ← JWT auth state
+│   │   ├── services/api.js             ← Axios wrapper
+│   │   └── App.jsx
 │   └── package.json
-├── docker-compose.yml
+├── docker-compose.yml              ← 4 services: db, mcp-server, backend, frontend
+├── docker-compose.prod.yml
 └── .env.example
 ```
 
@@ -80,55 +118,54 @@ doctor-appointment-mcp/
 
 ## Quick Start
 
-### Option A — Docker Compose (recommended)
+### Docker Compose (recommended — starts all 4 services)
 
 ```bash
-# 1. Clone and enter the project
-cd doctor-appointment-mcp
+# 1. Clone
+git clone https://github.com/harshag121/fse-assignment
+cd fse-assignment
 
-# 2. Configure environment variables
+# 2. Configure
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env — fill in GROQ_API_KEY, GMAIL_ADDRESS, GMAIL_APP_PASSWORD, SLACK_BOT_TOKEN
 
-# 3. Start everything
+# 3. Start
 docker compose up --build
 
-# Frontend → http://localhost:3000
-# Backend  → http://localhost:8000
-# API docs → http://localhost:8000/docs
-# MCP SSE  → http://localhost:8000/mcp/sse
+# Services:
+#   Frontend  → http://localhost:3000
+#   Backend   → http://localhost:8000
+#   API docs  → http://localhost:8000/docs
+#   MCP Server→ http://localhost:8001/sse   (MCP SSE endpoint)
 ```
 
-### Option B — Local development
+### Local Development (two terminals required)
 
-#### Backend
 ```bash
-cd backend
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Create .env (from project root .env.example)
-cp ../.env.example .env
-# Edit .env with your values
-
-# Start PostgreSQL (ensure it's running locally or via Docker)
-docker run -d -e POSTGRES_USER=docuser -e POSTGRES_PASSWORD=docpass \
+# --- Shared: start PostgreSQL ---
+docker run -d \
+  -e POSTGRES_USER=docuser -e POSTGRES_PASSWORD=docpass \
   -e POSTGRES_DB=docappointment -p 5432:5432 postgres:15-alpine
 
-# Run the server
-uvicorn app.main:app --reload --port 8000
-```
+cd backend
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+cp ../.env.example .env    # fill in your keys
 
-#### Frontend
-```bash
-cd frontend
-npm install
-npm start
+# Terminal 1 — MCP SERVER (must start first)
+python mcp_server_main.py
+# → Listening on http://localhost:8001
+# → SSE endpoint: http://localhost:8001/sse
+
+# Terminal 2 — FastAPI + MCP CLIENT
+uvicorn app.main:app --reload --port 8000
+# → Connects to MCP server at localhost:8001
+# → REST API: http://localhost:8000
+# → Swagger:  http://localhost:8000/docs
+
+# Terminal 3 — React frontend
+cd frontend && npm install && npm start
 # → http://localhost:3000
 ```
 
@@ -138,34 +175,38 @@ npm start
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DATABASE_URL` | Yes | PostgreSQL async URL |
+| `DATABASE_URL` | Yes | `postgresql+asyncpg://user:pass@host/db` |
 | `SECRET_KEY` | Yes | JWT signing secret |
-| `OPENAI_API_KEY` | Yes | OpenAI API key for LLM orchestration |
-| `LLM_MODEL` | No | Default: `gpt-4o` |
-| `GOOGLE_CREDENTIALS_JSON` | Optional | Google service account JSON (Calendar) |
-| `SENDGRID_API_KEY` | Optional | SendGrid key for email confirmations |
-| `FROM_EMAIL` | Optional | Sender email address |
+| `GROQ_API_KEY` | Yes | Groq API key (free at console.groq.com) |
+| `LLM_MODEL` | No | Default: `llama-3.3-70b-versatile` |
+| `MCP_SERVER_URL` | No | Default: `http://localhost:8001/sse` (Docker: `http://mcp-server:8001/sse`) |
+| `GMAIL_ADDRESS` | Optional | Gmail address for confirmation emails |
+| `GMAIL_APP_PASSWORD` | Optional | Gmail app password (not your account password) |
+| `GOOGLE_CREDENTIALS_JSON` | Optional | Service account JSON for Google Calendar |
 | `SLACK_BOT_TOKEN` | Optional | Slack bot token for doctor notifications |
-| `SLACK_DEFAULT_CHANNEL` | Optional | Default Slack channel |
+| `SLACK_DEFAULT_CHANNEL` | Optional | Slack channel ID or user ID |
 | `TWILIO_ACCOUNT_SID` | Optional | Twilio SID (WhatsApp fallback) |
 | `TWILIO_AUTH_TOKEN` | Optional | Twilio auth token |
 | `TWILIO_WHATSAPP_FROM` | Optional | Twilio WhatsApp sender number |
+| `FRONTEND_URL` | Optional | Production frontend URL (CORS) |
 
 ---
 
 ## MCP Tools Reference
 
-| Tool | Description |
-|------|-------------|
-| `check_doctor_availability` | Returns free slots for a doctor on a date |
-| `book_appointment` | Creates appointment + Google Calendar event |
-| `send_email_confirmation` | Sends HTML confirmation email via SendGrid |
-| `query_appointments_stats` | Aggregates appointment statistics for reports |
-| `send_doctor_notification` | Sends report via Slack or WhatsApp |
-| `auto_reschedule` | Suggests alternative slots on conflict |
+All tools live in `backend/app/mcp_server/tools.py` and are **registered with the MCP server** at startup. The LLM service discovers them dynamically via `session.list_tools()` — they are never imported or called directly by the client.
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `check_doctor_availability` | `doctor_name`, `date` | Returns free 30-min slots for a doctor |
+| `book_appointment` | `doctor_id`, `patient_id`, `datetime`, `symptoms` | Creates appointment + Google Calendar event |
+| `send_email_confirmation` | `to_email`, `patient_name`, `doctor_name`, `appointment_datetime` | Sends confirmation email via Gmail |
+| `query_appointments_stats` | `doctor_id`, `date_range`, `filter?` | Aggregates appointment statistics |
+| `send_doctor_notification` | `doctor_id`, `message` | Sends report to doctor via Slack |
+| `auto_reschedule` | `doctor_id`, `preferred_date`, `symptoms?` | Suggests alternative slots when time is taken |
 
 ### MCP Resources
-- `doctors://list` — all doctors
+- `doctors://list` — all doctors in the database
 - `doctors://{id}/schedule` — a doctor's upcoming appointments
 - `appointments://history?doctor_id={id}&date={date}` — historical data
 
@@ -178,70 +219,65 @@ npm start
 ## API Endpoints
 
 ```
-POST   /api/auth/token              Login (returns JWT)
-POST   /api/doctors                 Register doctor
-GET    /api/doctors                 List all doctors
-GET    /api/doctors/{id}            Get doctor
-GET    /api/doctors/{id}/availability  Doctor availability schedule
-POST   /api/patients                Register patient
-GET    /api/patients/{id}           Get patient
-POST   /api/availability            Set doctor availability slot
-GET    /api/appointments            List appointments (filter by doctor/patient)
-GET    /api/appointments/{id}       Get appointment
-PATCH  /api/appointments/{id}/cancel  Cancel appointment
-POST   /api/chat                    Chat with AI agent
-GET    /api/chat/{session_id}/history  Get conversation history
-POST   /api/reports/generate        Doctor natural-language report
+POST   /api/auth/token                  Login → JWT
+POST   /api/doctors                     Register doctor
+GET    /api/doctors                     List all doctors
+GET    /api/doctors/{id}                Get doctor
+GET    /api/doctors/{id}/availability   Availability schedule
+POST   /api/patients                    Register patient
+GET    /api/patients/{id}               Get patient
+POST   /api/availability                Set availability slot
+GET    /api/appointments                List (filter by doctor_id / patient_id)
+GET    /api/appointments/{id}           Get appointment
+PATCH  /api/appointments/{id}/cancel    Cancel appointment
+POST   /api/chat                        Chat with AI agent (MCP orchestrated)
+GET    /api/chat/{session_id}/history   Conversation history
+POST   /api/reports/generate            Doctor natural-language report
 
-GET    /mcp/sse                     MCP server (SSE)
-POST   /mcp/messages/               MCP messages endpoint
-GET    /health                      Health check
-GET    /docs                        Swagger UI
+GET    /health                          Health check
+GET    /docs                            Swagger UI
+
+# Separate MCP Server process (port 8001):
+GET    http://localhost:8001/sse         MCP SSE stream (client connects here)
+POST   http://localhost:8001/messages/  MCP message endpoint
 ```
 
 ---
 
-## Sample Prompts
+## Demo Users
 
-### Patient flow
-```
-"I want to book an appointment with Dr. Ahuja tomorrow at 3PM"
-"Check Dr. Smith's availability for next Monday morning"
-"Book any available slot with Dr. Ahuja this week for fever consultation"
-```
-
-### Doctor flow
-```
-"How many patients visited yesterday?"
-"How many appointments do I have today and tomorrow?"
-"How many patients came in with fever last week?"
-"Send me a summary of this week's appointments"
-```
-
-### Multi-turn context
-```
-Turn 1: "Check Dr. Ahuja's availability for Friday afternoon"
-Turn 2: "Book the 3PM slot"          ← agent remembers doctor + date
-Turn 3: "Actually, reschedule to 4PM" ← agent remembers the booking
-```
+| Role | Email | Password |
+|------|-------|----------|
+| Patient (Harsha) | gharshavardhan211@gmail.com | test123 |
+| Dr. Ahuja (Cardiology) | ahuja@hospital.com | test123 |
+| Dr. Smith (General Medicine) | smith@hospital.com | test123 |
 
 ---
 
-## Seeding Demo Data
+## Sample Conversations
 
-After the server is running, use the Swagger UI at `/docs` to:
+### Patient — booking flow
+```
+"Check Dr. Ahuja's availability for tomorrow"
+"Book the 10:00 slot for a cough"
+"Actually, can you suggest other times if 10AM is taken?"
+```
 
-1. `POST /api/doctors` — create a doctor (e.g. Dr. Ahuja, Cardiology)
-2. `POST /api/availability` — add doctor availability slots (day_of_week 0-6, HH:MM times)
-3. `POST /api/patients` — create a patient
-4. Use the chat interface to test natural language booking
+### Doctor — analytics + reporting
+```
+"How many appointments did I have this week?"
+"Show me all fever cases from last week"
+"Send a summary report to Slack"
+"How many appointments do I have tomorrow?"
+```
 
 ---
 
 ## Key Design Decisions
 
-- **Agentic loop** (max 10 rounds) — the LLM keeps calling tools until it has enough data to reply, without hardcoded workflows.
-- **Session-based memory** — last 10 messages loaded per session from PostgreSQL, giving multi-turn context.
-- **MCP + REST dual interface** — tools are reachable both via MCP SSE (for external MCP clients) and directly from the REST API's LLM service.
-- **Graceful degradation** — email/calendar integrations are optional; the booking still succeeds if they're not configured.
-- **Slack → WhatsApp fallback** — notification service automatically falls back to Twilio WhatsApp if Slack token is absent.
+- **True MCP architecture** — two separate processes with protocol-based communication. The LLM service is a genuine MCP client; the tool server is a genuine MCP server. No direct Python imports or function calls cross the client-server boundary.
+- **Dynamic tool discovery** — `session.list_tools()` is called at the start of every chat turn. Adding or removing tools from the MCP server requires zero changes to the LLM service.
+- **Single SSE session per chat turn** — one `sse_client` connection is opened and held for the full agentic loop, then closed. This ensures all tool calls in one turn share a session and avoids connection-per-tool overhead.
+- **Agentic loop (max 10 rounds)** — the LLM picks tools until it has enough data to reply, supporting multi-step flows (check availability → book → send email) automatically.
+- **Session memory** — last 10 messages per session loaded from PostgreSQL for multi-turn context.
+- **Graceful degradation** — Calendar / Email / Slack integrations are optional; bookings still succeed if not configured.

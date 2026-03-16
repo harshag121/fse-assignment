@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # MCP
     MCP_SERVER_NAME: str = "doctor-appointment-server"
     MCP_SERVER_VERSION: str = "1.0.0"
+    # URL of the standalone MCP server (port 8001).
+    # Override to http://mcp-server:8001/sse when running inside Docker.
+    MCP_SERVER_URL: str = "http://localhost:8001/sse"
 
     class Config:
         env_file = ".env"

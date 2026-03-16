@@ -1,138 +1,26 @@
-"""LLM Service - orchestrates tool-calling via OpenAI or Anthropic."""
+"""LLM Service — acts as an MCP *client*.
+
+Architecture:
+  1. At the start of every chat turn, connects to the MCP server (port 8001) via SSE.
+  2. Calls session.list_tools()  → discovers available tools dynamically (no hardcoding).
+  3. Passes the tool schemas to the LLM (Groq/OpenAI).
+  4. When the LLM requests a tool call, invokes session.call_tool() through the MCP
+     protocol — never calling Python functions directly.
+  5. Feeds the tool result back to the LLM and repeats until the model stops calling tools.
+"""
 import json
-import uuid
 from typing import Any
 
-from sqlalchemy import select, and_
-from sqlalchemy.ext.asyncio import AsyncSession
+from mcp.client.sse import sse_client
+from mcp import ClientSession
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.models.database import Conversation, AsyncSessionLocal
-from app.mcp_server.tools import (
-    _check_doctor_availability,
-    _book_appointment,
-    _send_email_confirmation,
-    _query_appointments_stats,
-    _send_doctor_notification,
-    _auto_reschedule,
-)
 
-# ── Tool definitions for OpenAI function-calling ──────────────────────────────
 
-OPENAI_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "check_doctor_availability",
-            "description": "Check available appointment slots for a doctor on a given date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "doctor_name": {"type": "string"},
-                    "date": {"type": "string", "description": "YYYY-MM-DD"},
-                },
-                "required": ["doctor_name", "date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "book_appointment",
-            "description": "Book an appointment for a patient with a doctor.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "doctor_id": {"type": "string", "description": "integer doctor ID"},
-                    "patient_id": {"type": "string", "description": "integer patient ID"},
-                    "datetime": {"type": "string", "description": "ISO 8601"},
-                    "symptoms": {"type": "string"},
-                },
-                "required": ["doctor_id", "patient_id", "datetime"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_email_confirmation",
-            "description": "Send appointment confirmation email to patient.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "to_email": {"type": "string"},
-                    "patient_name": {"type": "string"},
-                    "doctor_name": {"type": "string"},
-                    "appointment_datetime": {"type": "string", "description": "ISO datetime, e.g. 2026-03-16T10:00:00"},
-                },
-                "required": ["to_email", "patient_name", "doctor_name", "appointment_datetime"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_appointments_stats",
-            "description": "Query appointment statistics for a doctor report.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "doctor_id": {"type": "string", "description": "integer doctor ID"},
-                    "date_range": {
-                        "type": "string",
-                        "enum": ["yesterday", "today", "tomorrow", "this_week", "last_week", "custom"],
-                    },
-                    "start_date": {"type": "string"},
-                    "end_date": {"type": "string"},
-                    "filter": {"type": "string"},
-                },
-                "required": ["doctor_id", "date_range"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_doctor_notification",
-            "description": "Send a summary report to a doctor via Slack.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "doctor_id": {"type": "string", "description": "integer doctor ID"},
-                    "message": {"type": "string"},
-                },
-                "required": ["doctor_id", "message"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "auto_reschedule",
-            "description": "Suggest alternative appointment slots when preferred time is unavailable.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "doctor_id": {"type": "string", "description": "integer doctor ID"},
-                    "preferred_date": {"type": "string", "description": "YYYY-MM-DD"},
-                    "symptoms": {"type": "string"},
-                },
-                "required": ["doctor_id", "preferred_date"],
-            },
-        },
-    },
-]
-
-TOOL_HANDLERS = {
-    "check_doctor_availability": _check_doctor_availability,
-    "book_appointment": _book_appointment,
-    "send_email_confirmation": _send_email_confirmation,
-    "query_appointments_stats": _query_appointments_stats,
-    "send_doctor_notification": _send_doctor_notification,
-    "auto_reschedule": _auto_reschedule,
-}
-
-# Integer fields per tool — coerce strings to int (Groq sometimes serialises ints as strings)
+# ── Integer fields that Groq may serialize as strings ─────────────────────────
+# Coerce them before sending to the MCP server so DB lookups work correctly.
 _INT_FIELDS: dict[str, list[str]] = {
     "book_appointment": ["doctor_id", "patient_id"],
     "query_appointments_stats": ["doctor_id"],
@@ -140,13 +28,26 @@ _INT_FIELDS: dict[str, list[str]] = {
     "auto_reschedule": ["doctor_id"],
 }
 
+
+def _mcp_tool_to_openai(tool) -> dict:
+    """Convert an MCP Tool object to the OpenAI function-calling schema."""
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description or "",
+            "parameters": tool.inputSchema,
+        },
+    }
+
+
 def _system_patient() -> str:
     from datetime import date
     today = date.today()
     return (
         f"You are a warm, professional medical appointment assistant.\n"
         f"TODAY'S DATE IS: {today.strftime('%Y-%m-%d')} ({today.strftime('%A, %d %B %Y')}). "
-        f"Always use this when interpreting 'today', 'tomorrow', 'this week', etc.\n"
+        "Always use this when interpreting 'today', 'tomorrow', 'this week', etc.\n"
         "Rules:\n"
         "1. Always call check_doctor_availability BEFORE booking.\n"
         "2. After booking, always call send_email_confirmation.\n"
@@ -166,7 +67,7 @@ def _system_doctor() -> str:
     return (
         f"You are a precise medical practice analytics assistant.\n"
         f"TODAY'S DATE IS: {today.strftime('%Y-%m-%d')} ({today.strftime('%A, %d %B %Y')}). "
-        f"Always use this when interpreting 'today', 'yesterday', 'this week', etc.\n"
+        "Always use this when interpreting 'today', 'yesterday', 'this week', etc.\n"
         "Rules:\n"
         "1. Always use query_appointments_stats to get real data.\n"
         "2. After fetching stats, present a clear bullet-point summary.\n"
@@ -178,21 +79,20 @@ def _system_doctor() -> str:
 
 class LLMService:
     def __init__(self):
-        self.client = None
+        self._openai_client = None
 
     def _get_openai(self):
-        if self.client:
-            return self.client
+        if self._openai_client:
+            return self._openai_client
         from openai import AsyncOpenAI
         if settings.GROQ_API_KEY:
-            # Groq is OpenAI-compatible — just swap base_url and key
-            self.client = AsyncOpenAI(
+            self._openai_client = AsyncOpenAI(
                 api_key=settings.GROQ_API_KEY,
                 base_url="https://api.groq.com/openai/v1",
             )
         else:
-            self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-        return self.client
+            self._openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        return self._openai_client
 
     async def _load_history(self, session_id: str, limit: int = 10) -> list[dict]:
         async with AsyncSessionLocal() as db:
@@ -205,13 +105,12 @@ class LLMService:
             )
             rows = result.scalars().all()
             rows.reverse()
-            # Only return role + content — strip tool_calls to avoid format issues
             return [{"role": row.role, "content": row.content or ""} for row in rows]
 
     async def _save_message(
         self,
         session_id: str,
-        user_id: str,
+        user_id: Any,
         role: str,
         content: str,
         tool_calls: Any = None,
@@ -234,13 +133,14 @@ class LLMService:
         role: str = "patient",
         user_id: int = None,
     ) -> dict:
-        """Run one turn of the agentic loop."""
+        """Run one turn of the agentic loop.
+
+        Uses the MCP protocol for ALL tool interactions:
+          - list_tools()  → dynamic discovery (no hardcoded schemas)
+          - call_tool()   → protocol-based invocation (no direct function calls)
+        """
         openai = self._get_openai()
-
-        # Load history
         history = await self._load_history(session_id)
-
-        # Persist user message
         await self._save_message(session_id, user_id, "user", user_message)
 
         system_prompt = _system_doctor() if role == "doctor" else _system_patient()
@@ -251,82 +151,99 @@ class LLMService:
         tools_called: list[str] = []
         appointments_affected: list[int] = []
 
-        # Agentic loop – keep running until the model stops calling tools
-        for _ in range(10):  # max 10 tool rounds
-            response = await openai.chat.completions.create(
-                model=settings.LLM_MODEL,
-                messages=messages,
-                tools=OPENAI_TOOLS,
-                tool_choice="auto",
-            )
-            msg = response.choices[0].message
+        # Open a single MCP connection that lasts the entire agentic loop.
+        # This is the client side of the MCP client-server protocol.
+        async with sse_client(settings.MCP_SERVER_URL) as (read, write):
+            async with ClientSession(read, write) as mcp_session:
 
-            if not msg.tool_calls:
-                # Final text response
-                assistant_text = msg.content or ""
-                await self._save_message(session_id, user_id, "assistant", assistant_text)
-                return {
-                    "reply": assistant_text,
-                    "tool_calls_made": tools_called,
-                    "appointments_affected": appointments_affected,
-                }
+                # ── MCP: initialise the session ────────────────────────────────
+                await mcp_session.initialize()
 
-            # Append assistant message with tool_calls to context
-            messages.append(msg)
+                # ── MCP: dynamic tool discovery ────────────────────────────────
+                # We never hardcode tool schemas here — we ask the server.
+                tools_result = await mcp_session.list_tools()
+                openai_tools = [_mcp_tool_to_openai(t) for t in tools_result.tools]
 
-            # Execute each tool call
-            for tc in msg.tool_calls:
-                fn_name = tc.function.name
-                fn_args = json.loads(tc.function.arguments)
-                # Coerce integer fields that Groq may serialize as strings
-                coerce_error = None
-                for field in _INT_FIELDS.get(fn_name, []):
-                    if field in fn_args and not isinstance(fn_args[field], int):
-                        try:
-                            fn_args[field] = int(fn_args[field])
-                        except (ValueError, TypeError):
-                            coerce_error = (
-                                f"Invalid value for '{field}': expected a plain integer ID "
-                                f"(e.g. 1), got '{fn_args[field]}'. "
-                                f"Use the actual numeric ID from previous tool results."
+                # ── Agentic loop ───────────────────────────────────────────────
+                for _ in range(10):  # max 10 tool rounds
+                    response = await openai.chat.completions.create(
+                        model=settings.LLM_MODEL,
+                        messages=messages,
+                        tools=openai_tools,
+                        tool_choice="auto",
+                    )
+                    msg = response.choices[0].message
+
+                    if not msg.tool_calls:
+                        # Model returned a final text response — done.
+                        assistant_text = msg.content or ""
+                        await self._save_message(session_id, user_id, "assistant", assistant_text)
+                        return {
+                            "reply": assistant_text,
+                            "tool_calls_made": tools_called,
+                            "appointments_affected": appointments_affected,
+                        }
+
+                    # Append the assistant's tool-call message to context.
+                    messages.append(msg)
+
+                    # Execute each tool the model requested.
+                    for tc in msg.tool_calls:
+                        fn_name = tc.function.name
+                        fn_args = json.loads(tc.function.arguments)
+
+                        # Coerce integer fields — Groq/Llama may serialize them as strings.
+                        coerce_error = None
+                        for field in _INT_FIELDS.get(fn_name, []):
+                            if field in fn_args and not isinstance(fn_args[field], int):
+                                try:
+                                    fn_args[field] = int(fn_args[field])
+                                except (ValueError, TypeError):
+                                    coerce_error = (
+                                        f"Invalid value for '{field}': expected a plain integer "
+                                        f"(e.g. 1), got '{fn_args[field]}'. "
+                                        "Use the numeric ID from a previous tool result."
+                                    )
+                                    break
+
+                        tools_called.append(fn_name)
+
+                        if coerce_error:
+                            result_text = json.dumps({"error": coerce_error})
+                        else:
+                            # ── MCP: protocol-based tool invocation ───────────
+                            # The tool runs inside the MCP server process;
+                            # we receive the result back through the protocol.
+                            mcp_result = await mcp_session.call_tool(fn_name, fn_args)
+                            result_text = (
+                                mcp_result.content[0].text
+                                if mcp_result.content and hasattr(mcp_result.content[0], "text")
+                                else "{}"
                             )
-                            break
-                tools_called.append(fn_name)
 
-                if coerce_error:
-                    result_text = json.dumps({"error": coerce_error})
-                else:
-                    handler = TOOL_HANDLERS.get(fn_name)
-                    if handler:
-                        result_contents = await handler(**fn_args)
-                        result_text = result_contents[0].text if result_contents else "{}"
-
-                        # Track appointment IDs
+                        # Track appointment IDs for the response metadata.
                         try:
                             parsed = json.loads(result_text)
                             if isinstance(parsed, dict) and "appointment_id" in parsed:
                                 appointments_affected.append(parsed["appointment_id"])
                         except Exception:
                             pass
-                    else:
-                        result_text = json.dumps({"error": f"Unknown tool: {fn_name}"})
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result_text,
-                })
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result_text,
+                        })
 
-                # Persist tool result in conversation
-                await self._save_message(
-                    session_id,
-                    user_id,
-                    "tool",
-                    result_text,
-                    tool_calls=[{"name": fn_name, "args": fn_args}],
-                )
+                        await self._save_message(
+                            session_id,
+                            user_id,
+                            "tool",
+                            result_text,
+                            tool_calls=[{"name": fn_name, "args": fn_args}],
+                        )
 
-        # Fallback if loop exhausted
+        # Fallback if the agentic loop exhausted its budget.
         final = "I've processed your request. Please check back for results."
         await self._save_message(session_id, user_id, "assistant", final)
         return {
