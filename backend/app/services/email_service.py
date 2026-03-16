@@ -49,10 +49,28 @@ class EmailService:
         msg["To"]      = to_email
         msg.attach(MIMEText(html_body, "html"))
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
-            server.login(settings.GMAIL_ADDRESS, settings.GMAIL_APP_PASSWORD)
-            server.sendmail(settings.GMAIL_ADDRESS, to_email, msg.as_string())
-        return "sent"
+        last_error = None
+
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+                server.login(settings.GMAIL_ADDRESS, settings.GMAIL_APP_PASSWORD)
+                server.sendmail(settings.GMAIL_ADDRESS, to_email, msg.as_string())
+                return "sent"
+        except OSError as exc:
+            last_error = exc
+
+        try:
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(settings.GMAIL_ADDRESS, settings.GMAIL_APP_PASSWORD)
+                server.sendmail(settings.GMAIL_ADDRESS, to_email, msg.as_string())
+                return "sent"
+        except OSError as exc:
+            last_error = exc
+
+        raise last_error or RuntimeError("Failed to send email")
 
     async def send_appointment_confirmation(
         self,

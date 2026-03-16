@@ -1,4 +1,5 @@
 """MCP Tools - the six core tools exposed to the AI agent."""
+import inspect
 import json
 from datetime import datetime, date, timedelta
 from typing import Any
@@ -45,6 +46,75 @@ def _generate_slots(
             slots.append({"start": current.strftime("%H:%M"), "end": slot_end.strftime("%H:%M")})
         current = slot_end
     return slots
+
+
+def _normalize_tool_arguments(name: str, arguments: dict | None) -> dict:
+    args = dict(arguments or {})
+
+    alias_map = {
+        "check_doctor_availability": {
+            "preferred_date": "date",
+            "target_date": "date",
+        },
+        "query_appointments_stats": {
+            "symptom": "filter",
+            "symptoms": "filter",
+        },
+        "send_doctor_notification": {
+            "report": "message",
+            "summary": "message",
+            "content": "message",
+        },
+        "send_email_confirmation": {
+            "start_time": "appointment_datetime",
+        },
+        "auto_reschedule": {
+            "date": "preferred_date",
+            "target_date": "preferred_date",
+        },
+    }
+
+    for src, dst in alias_map.get(name, {}).items():
+        if src in args and dst not in args and args[src] not in (None, ""):
+            args[dst] = args[src]
+
+    if name == "query_appointments_stats":
+        exact_date = args.get("date") or args.get("target_date")
+        if exact_date and not args.get("start_date") and not args.get("end_date"):
+            args["date_range"] = "custom"
+            args["start_date"] = exact_date
+            args["end_date"] = exact_date
+
+    return args
+
+
+async def _invoke_tool_handler(name: str, handler, arguments: dict) -> list[TextContent]:
+    args = _normalize_tool_arguments(name, arguments)
+    signature = inspect.signature(handler)
+    filtered_args: dict[str, Any] = {}
+
+    for param_name, param in signature.parameters.items():
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        if param_name in args:
+            filtered_args[param_name] = args[param_name]
+
+    try:
+        return await handler(**filtered_args)
+    except Exception as exc:
+        return _err(f"Tool '{name}' failed: {exc}")
+
+
+async def _resolve_doctor(doctor_id: int | None = None, doctor_name: str | None = None) -> Doctor | None:
+    async with AsyncSessionLocal() as db:
+        if doctor_id is not None:
+            return await db.get(Doctor, doctor_id)
+        if doctor_name:
+            result = await db.execute(
+                select(Doctor).where(Doctor.name.ilike(f"%{doctor_name}%"))
+            )
+            return result.scalars().first()
+    return None
 
 
 async def _availability_payload_for_doctor(doctor: Doctor, target_date: date) -> dict:
@@ -209,37 +279,40 @@ def register_tools(server: Server):
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict):
-        if name == "check_doctor_availability":
-            return await _check_doctor_availability(**arguments)
-        if name == "book_appointment":
-            return await _book_appointment(**arguments)
-        if name == "send_email_confirmation":
-            return await _send_email_confirmation(**arguments)
-        if name == "query_appointments_stats":
-            return await _query_appointments_stats(**arguments)
-        if name == "send_doctor_notification":
-            return await _send_doctor_notification(**arguments)
-        if name == "auto_reschedule":
-            return await _auto_reschedule(**arguments)
-        return _err(f"Unknown tool: {name}")
+        handlers = {
+            "check_doctor_availability": _check_doctor_availability,
+            "book_appointment": _book_appointment,
+            "send_email_confirmation": _send_email_confirmation,
+            "query_appointments_stats": _query_appointments_stats,
+            "send_doctor_notification": _send_doctor_notification,
+            "auto_reschedule": _auto_reschedule,
+        }
+        handler = handlers.get(name)
+        if not handler:
+            return _err(f"Unknown tool: {name}")
+        return await _invoke_tool_handler(name, handler, arguments)
 
 
 # ── Individual Tool Implementations ───────────────────────────────────────────
 
-async def _check_doctor_availability(doctor_name: str, date: str):
+async def _check_doctor_availability(
+    doctor_name: str | None = None,
+    date: str | None = None,
+    doctor_id: int | None = None,
+):
+    if not date:
+        return _err("Missing date. Use YYYY-MM-DD.")
+
     try:
         target_date = datetime.strptime(date, "%Y-%m-%d").date()
     except ValueError:
         return _err("Invalid date format. Use YYYY-MM-DD.")
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Doctor).where(Doctor.name.ilike(f"%{doctor_name}%"))
-        )
-        doctor = result.scalars().first()
-        if not doctor:
-            return _err(f"Doctor '{doctor_name}' not found.")
-        return _ok(await _availability_payload_for_doctor(doctor, target_date))
+    doctor = await _resolve_doctor(doctor_id=doctor_id, doctor_name=doctor_name)
+    if not doctor:
+        identifier = f"ID {doctor_id}" if doctor_id is not None else f"'{doctor_name}'"
+        return _err(f"Doctor {identifier} not found.")
+    return _ok(await _availability_payload_for_doctor(doctor, target_date))
 
 
 async def _book_appointment(
@@ -324,8 +397,13 @@ async def _send_email_confirmation(
     to_email: str,
     patient_name: str,
     doctor_name: str,
-    appointment_datetime: str,
+    appointment_datetime: str | None = None,
+    start_time: str | None = None,
 ):
+    appointment_datetime = appointment_datetime or start_time
+    if not appointment_datetime:
+        return _err("Missing appointment_datetime.")
+
     from app.services.email_service import EmailService
     appointment_details = {
         "doctor_name": doctor_name,
@@ -345,12 +423,33 @@ async def _send_email_confirmation(
 
 
 async def _query_appointments_stats(
-    doctor_id: int,
-    date_range: str,
+    doctor_id: int | None = None,
+    date_range: str = "today",
     start_date: str = None,
     end_date: str = None,
     filter: str = None,
+    doctor_name: str | None = None,
+    target_date: str | None = None,
+    symptom: str | None = None,
+    symptoms: str | None = None,
 ):
+    if filter is None:
+        filter = symptom or symptoms
+
+    if target_date and not (start_date and end_date):
+        date_range = "custom"
+        start_date = target_date
+        end_date = target_date
+
+    if doctor_id is None and doctor_name:
+        doctor = await _resolve_doctor(doctor_name=doctor_name)
+        if not doctor:
+            return _err(f"Doctor '{doctor_name}' not found.")
+        doctor_id = doctor.id
+
+    if doctor_id is None:
+        return _err("Missing doctor_id.")
+
     today = date.today()
     if date_range == "yesterday":
         start = end = today - timedelta(days=1)
@@ -418,16 +517,23 @@ async def _query_appointments_stats(
 
 
 async def _send_doctor_notification(
-    doctor_id: int,
-    message: str,
+    doctor_id: int | None = None,
+    message: str | None = None,
     channel: str = None,
+    doctor_name: str | None = None,
+    report: str | None = None,
+    summary: str | None = None,
 ):
     from app.services.notification_service import NotificationService
 
-    async with AsyncSessionLocal() as db:
-        doctor = await db.get(Doctor, doctor_id)
-        if not doctor:
-            return _err(f"Doctor ID {doctor_id} not found.")
+    message = message or report or summary
+    if not message:
+        return _err("Missing message.")
+
+    doctor = await _resolve_doctor(doctor_id=doctor_id, doctor_name=doctor_name)
+    if not doctor:
+        identifier = f"ID {doctor_id}" if doctor_id is not None else f"'{doctor_name}'"
+        return _err(f"Doctor {identifier} not found.")
 
     svc = NotificationService()
     try:
@@ -442,19 +548,25 @@ async def _send_doctor_notification(
 
 
 async def _auto_reschedule(
-    doctor_id: int,
-    preferred_date: str,
+    doctor_id: int | None = None,
+    preferred_date: str | None = None,
     symptoms: str = "",
+    doctor_name: str | None = None,
+    date: str | None = None,
 ):
+    preferred_date = preferred_date or date
+    if not preferred_date:
+        return _err("Missing preferred_date. Use YYYY-MM-DD.")
+
     try:
         pref_date = datetime.strptime(preferred_date, "%Y-%m-%d").date()
     except ValueError:
         return _err("Invalid date format. Use YYYY-MM-DD.")
 
-    async with AsyncSessionLocal() as db:
-        doctor = await db.get(Doctor, doctor_id)
-        if not doctor:
-            return _err(f"Doctor ID {doctor_id} not found.")
+    doctor = await _resolve_doctor(doctor_id=doctor_id, doctor_name=doctor_name)
+    if not doctor:
+        identifier = f"ID {doctor_id}" if doctor_id is not None else f"'{doctor_name}'"
+        return _err(f"Doctor {identifier} not found.")
 
     suggestions = []
     # Check the preferred date and the 3 following days

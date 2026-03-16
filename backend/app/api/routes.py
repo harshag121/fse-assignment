@@ -160,13 +160,22 @@ async def get_appointment(appointment_id: int, db: AsyncSession = Depends(get_db
 
 @router.patch("/appointments/{appointment_id}/cancel", response_model=AppointmentOut, tags=["appointments"])
 async def cancel_appointment(appointment_id: int, db: AsyncSession = Depends(get_db)):
-    appt = await db.get(Appointment, appointment_id)
+    result = await db.execute(
+        select(Appointment)
+        .options(selectinload(Appointment.doctor), selectinload(Appointment.patient))
+        .where(Appointment.id == appointment_id)
+    )
+    appt = result.scalars().first()
     if not appt:
         raise HTTPException(404, "Appointment not found")
     appt.status = AppointmentStatus.CANCELLED
     await db.commit()
-    await db.refresh(appt)
-    return appt
+    result = await db.execute(
+        select(Appointment)
+        .options(selectinload(Appointment.doctor), selectinload(Appointment.patient))
+        .where(Appointment.id == appointment_id)
+    )
+    return result.scalars().first()
 
 
 # ── Chat (Agentic AI) ─────────────────────────────────────────────────────────
