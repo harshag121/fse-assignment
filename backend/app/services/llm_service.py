@@ -8,6 +8,7 @@ Architecture:
      protocol — never calling Python functions directly.
   5. Feeds the tool result back to the LLM and repeats until the model stops calling tools.
 """
+import asyncio
 import json
 from typing import Any
 
@@ -80,6 +81,8 @@ def _system_doctor() -> str:
 class LLMService:
     def __init__(self):
         self._openai_client = None
+        # SSE-based MCP server handles one connection at a time; serialize access.
+        self._mcp_lock = asyncio.Semaphore(1)
 
     def _get_openai(self):
         if self._openai_client:
@@ -152,109 +155,118 @@ class LLMService:
         appointments_affected: list[int] = []
 
         # Open a single MCP connection that lasts the entire agentic loop.
-        # This is the client side of the MCP client-server protocol.
+        # Semaphore ensures only one SSE connection is open at a time (server limit).
         try:
-            async with sse_client(settings.MCP_SERVER_URL) as (read, write):
-                async with ClientSession(read, write) as mcp_session:
+            async with self._mcp_lock:
+                async with sse_client(settings.MCP_SERVER_URL) as (read, write):
+                    async with ClientSession(read, write) as mcp_session:
 
-                    # ── MCP: initialise the session ────────────────────────────────
-                    await mcp_session.initialize()
+                        # ── MCP: initialise the session ────────────────────────────────
+                        await mcp_session.initialize()
 
-                    # ── MCP: dynamic tool discovery ────────────────────────────────
-                    # We never hardcode tool schemas here — we ask the server.
-                    tools_result = await mcp_session.list_tools()
-                    openai_tools = [_mcp_tool_to_openai(t) for t in tools_result.tools]
+                        # ── MCP: dynamic tool discovery ────────────────────────────────
+                        # We never hardcode tool schemas here — we ask the server.
+                        tools_result = await mcp_session.list_tools()
+                        openai_tools = [_mcp_tool_to_openai(t) for t in tools_result.tools]
 
-                    # ── Agentic loop ───────────────────────────────────────────────
-                    for _ in range(10):  # max 10 tool rounds
-                        response = await openai.chat.completions.create(
-                            model=settings.LLM_MODEL,
-                            messages=messages,
-                            tools=openai_tools,
-                            tool_choice="auto",
-                        )
-                        msg = response.choices[0].message
+                        # ── Agentic loop ───────────────────────────────────────────────
+                        for _ in range(10):  # max 10 tool rounds
+                            response = await openai.chat.completions.create(
+                                model=settings.LLM_MODEL,
+                                messages=messages,
+                                tools=openai_tools,
+                                tool_choice="auto",
+                            )
+                            msg = response.choices[0].message
 
-                        if not msg.tool_calls:
-                            # Model returned a final text response — done.
-                            assistant_text = msg.content or ""
-                            await self._save_message(session_id, user_id, "assistant", assistant_text)
-                            return {
-                                "reply": assistant_text,
-                                "tool_calls_made": tools_called,
-                                "appointments_affected": appointments_affected,
-                            }
+                            if not msg.tool_calls:
+                                # Model returned a final text response — done.
+                                assistant_text = msg.content or ""
+                                await self._save_message(session_id, user_id, "assistant", assistant_text)
+                                return {
+                                    "reply": assistant_text,
+                                    "tool_calls_made": tools_called,
+                                    "appointments_affected": appointments_affected,
+                                }
 
-                        # Append the assistant's tool-call message to context.
-                        messages.append(msg)
+                            # Append the assistant's tool-call message to context.
+                            messages.append(msg)
 
-                        # Execute each tool the model requested.
-                        for tc in msg.tool_calls:
-                            fn_name = tc.function.name
-                            fn_args = json.loads(tc.function.arguments)
+                            # Execute each tool the model requested.
+                            for tc in msg.tool_calls:
+                                fn_name = tc.function.name
+                                fn_args = json.loads(tc.function.arguments)
 
-                            # Coerce integer fields — Groq/Llama may serialize them as strings.
-                            coerce_error = None
-                            for field in _INT_FIELDS.get(fn_name, []):
-                                if field in fn_args and not isinstance(fn_args[field], int):
-                                    try:
-                                        fn_args[field] = int(fn_args[field])
-                                    except (ValueError, TypeError):
-                                        coerce_error = (
-                                            f"Invalid value for '{field}': expected a plain integer "
-                                            f"(e.g. 1), got '{fn_args[field]}'. "
-                                            "Use the numeric ID from a previous tool result."
-                                        )
-                                        break
+                                # Coerce integer fields — Groq/Llama may serialize them as strings.
+                                coerce_error = None
+                                for field in _INT_FIELDS.get(fn_name, []):
+                                    if field in fn_args and not isinstance(fn_args[field], int):
+                                        try:
+                                            fn_args[field] = int(fn_args[field])
+                                        except (ValueError, TypeError):
+                                            coerce_error = (
+                                                f"Invalid value for '{field}': expected a plain integer "
+                                                f"(e.g. 1), got '{fn_args[field]}'. "
+                                                "Use the numeric ID from a previous tool result."
+                                            )
+                                            break
 
-                            tools_called.append(fn_name)
+                                tools_called.append(fn_name)
 
-                            if coerce_error:
-                                result_text = json.dumps({"error": coerce_error})
-                            else:
-                                # ── MCP: protocol-based tool invocation ───────────
-                                # The tool runs inside the MCP server process;
-                                # we receive the result back through the protocol.
-                                mcp_result = await mcp_session.call_tool(fn_name, fn_args)
-                                result_text = (
-                                    mcp_result.content[0].text
-                                    if mcp_result.content and hasattr(mcp_result.content[0], "text")
-                                    else "{}"
+                                if coerce_error:
+                                    result_text = json.dumps({"error": coerce_error})
+                                else:
+                                    # ── MCP: protocol-based tool invocation ───────────
+                                    # The tool runs inside the MCP server process;
+                                    # we receive the result back through the protocol.
+                                    mcp_result = await mcp_session.call_tool(fn_name, fn_args)
+                                    result_text = (
+                                        mcp_result.content[0].text
+                                        if mcp_result.content and hasattr(mcp_result.content[0], "text")
+                                        else "{}"
+                                    )
+
+                                # Track appointment IDs for the response metadata.
+                                try:
+                                    parsed = json.loads(result_text)
+                                    if isinstance(parsed, dict) and "appointment_id" in parsed:
+                                        appointments_affected.append(parsed["appointment_id"])
+                                except Exception:
+                                    pass
+
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": result_text,
+                                })
+
+                                await self._save_message(
+                                    session_id,
+                                    user_id,
+                                    "tool",
+                                    result_text,
+                                    tool_calls=[{"name": fn_name, "args": fn_args}],
                                 )
 
-                            # Track appointment IDs for the response metadata.
-                            try:
-                                parsed = json.loads(result_text)
-                                if isinstance(parsed, dict) and "appointment_id" in parsed:
-                                    appointments_affected.append(parsed["appointment_id"])
-                            except Exception:
-                                pass
-
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": result_text,
-                            })
-
-                            await self._save_message(
-                                session_id,
-                                user_id,
-                                "tool",
-                                result_text,
-                                tool_calls=[{"name": fn_name, "args": fn_args}],
-                            )
-
         except Exception as exc:
-            # Unwrap anyio ExceptionGroup (Python 3.11+) for a readable message.
+            # Unwrap anyio ExceptionGroup (Python 3.11+) to inspect cause.
             causes = getattr(exc, "exceptions", None)
-            if causes:
-                raw = "; ".join(str(c) for c in causes)
-            else:
-                raw = str(exc)
-            raise RuntimeError(
-                f"Cannot connect to MCP server at {settings.MCP_SERVER_URL}. "
-                f"Make sure the MCP server process is running. Detail: {raw}"
-            ) from exc
+            raw = "; ".join(str(c) for c in causes) if causes else str(exc)
+            all_causes = list(causes) if causes else [exc]
+
+            # Only rewrite the error when the failure is a network connection
+            # problem reaching the MCP server.  Other errors (Groq API, DB, ...)
+            # are re-raised unchanged so the caller can handle them properly.
+            _conn_types = (ConnectionRefusedError, OSError, ConnectionError)
+            is_conn_err = any(isinstance(c, _conn_types) for c in all_causes) or any(
+                kw in raw.lower() for kw in ("connect", "refused", "unreachable", "nodename")
+            )
+            if is_conn_err:
+                raise RuntimeError(
+                    f"Cannot connect to MCP server at {settings.MCP_SERVER_URL}. "
+                    "Make sure the MCP server process is running."
+                ) from exc
+            raise
 
         # Fallback if the agentic loop exhausted its budget.
         final = "I've processed your request. Please check back for results."
