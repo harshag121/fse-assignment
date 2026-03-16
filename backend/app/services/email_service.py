@@ -49,7 +49,7 @@ class EmailService:
         msg["To"]      = to_email
         msg.attach(MIMEText(html_body, "html"))
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
             server.login(settings.GMAIL_ADDRESS, settings.GMAIL_APP_PASSWORD)
             server.sendmail(settings.GMAIL_ADDRESS, to_email, msg.as_string())
         return "sent"

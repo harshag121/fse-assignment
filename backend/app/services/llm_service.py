@@ -56,7 +56,9 @@ def _system_patient() -> str:
         "4. Never invent data – only use tool results.\n"
         "5. Maintain context across the conversation (doctor, date, time chosen).\n"
         "6. Be concise and friendly. Confirm details before finalising.\n"
-        "7. CRITICAL: doctor_id and patient_id must be plain integers (e.g. 1, 2). "
+        "7. If the user picks a slot from a previous message, reuse the doctor and date from conversation history.\n"
+        "8. When the user asks for alternatives because a slot is unavailable, call auto_reschedule for the same doctor.\n"
+        "9. CRITICAL: doctor_id and patient_id must be plain integers (e.g. 1, 2). "
         "Get the doctor_id from check_doctor_availability results. "
         "NEVER use a variable name, function name, or placeholder as an ID."
     )
@@ -74,7 +76,10 @@ def _system_doctor() -> str:
         "2. After fetching stats, present a clear bullet-point summary.\n"
         "3. When asked to send a report, call send_doctor_notification with the summary.\n"
         "4. Support ranges: today, yesterday, this_week, last_week, custom.\n"
-        "5. Be concise and professional."
+        "5. If the user mentions an exact date, call query_appointments_stats with "
+        "date_range='custom' and set both start_date and end_date to that date.\n"
+        "6. If the user asks about a symptom such as fever, pass that word in the filter field.\n"
+        "7. Be concise and professional."
     )
 
 

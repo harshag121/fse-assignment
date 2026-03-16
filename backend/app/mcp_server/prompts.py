@@ -40,7 +40,8 @@ def register_prompts(server: Server):
                 "4. If requested time is unavailable, call auto_reschedule to suggest alternatives.\n"
                 "5. Maintain context across turns (e.g. remember chosen doctor, date, time).\n"
                 "6. Never invent available slots – only use data returned by tools.\n"
-                "7. Be concise but friendly. Confirm all booking details with the patient before finalising."
+                "7. Reuse the doctor and date from conversation history when the patient picks a slot in a follow-up turn.\n"
+                "8. Be concise but friendly. Confirm all booking details with the patient before finalising."
             )
             return GetPromptResult(
                 description="Appointment booking system prompt",
@@ -56,8 +57,10 @@ def register_prompts(server: Server):
                 "2. Present statistics in a clear, professional summary.\n"
                 "3. When asked to send a report, use send_doctor_notification after querying stats.\n"
                 "4. Support natural language date ranges: 'yesterday', 'today', 'this week', custom ranges.\n"
-                "5. Highlight anomalies (e.g. unusual symptom spikes) when present.\n"
-                "6. Be concise – bullet points preferred over lengthy prose."
+                "5. When the doctor names a specific date, use a custom single-day range for that exact date.\n"
+                "6. If they ask about a symptom like fever, pass it as the filter argument.\n"
+                "7. Highlight anomalies (e.g. unusual symptom spikes) when present.\n"
+                "8. Be concise – bullet points preferred over lengthy prose."
             )
             return GetPromptResult(
                 description="Doctor report system prompt",

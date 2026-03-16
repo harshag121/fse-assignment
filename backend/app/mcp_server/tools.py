@@ -47,6 +47,69 @@ def _generate_slots(
     return slots
 
 
+async def _availability_payload_for_doctor(doctor: Doctor, target_date: date) -> dict:
+    async with AsyncSessionLocal() as db:
+        day_of_week = target_date.weekday()  # 0=Mon
+        avail_result = await db.execute(
+            select(Availability).where(
+                and_(
+                    Availability.doctor_id == doctor.id,
+                    Availability.day_of_week == day_of_week,
+                    Availability.is_available == True,
+                )
+            )
+        )
+        avail_rows = avail_result.scalars().all()
+        if not avail_rows:
+            return {
+                "doctor_id": doctor.id,
+                "doctor_name": doctor.name,
+                "date": str(target_date),
+                "available_slots": [],
+                "message": f"Dr. {doctor.name} is not available on {target_date.strftime('%A, %d %b %Y')}.",
+            }
+
+        start_of_day = datetime.combine(target_date, datetime.min.time())
+        end_of_day = datetime.combine(target_date, datetime.max.time())
+        booked_result = await db.execute(
+            select(Appointment.start_time).where(
+                and_(
+                    Appointment.doctor_id == doctor.id,
+                    Appointment.start_time >= start_of_day,
+                    Appointment.start_time <= end_of_day,
+                    Appointment.status != AppointmentStatus.CANCELLED,
+                )
+            )
+        )
+        booked_starts = {row[0].replace(second=0, microsecond=0) for row in booked_result.all()}
+
+        seen_slots: set[tuple[str, str]] = set()
+        all_slots: list[dict] = []
+        for row in avail_rows:
+            slots = _generate_slots(
+                row.start_time,
+                row.end_time,
+                row.slot_duration_minutes,
+                booked_starts,
+                target_date,
+            )
+            for slot in slots:
+                slot_key = (slot["start"], slot["end"])
+                if slot_key in seen_slots:
+                    continue
+                seen_slots.add(slot_key)
+                all_slots.append(slot)
+
+        all_slots.sort(key=lambda slot: slot["start"])
+        return {
+            "doctor_id": doctor.id,
+            "doctor_name": doctor.name,
+            "specialization": doctor.specialization,
+            "date": str(target_date),
+            "available_slots": all_slots,
+        }
+
+
 def register_tools(server: Server):
 
     @server.list_tools()
@@ -176,60 +239,7 @@ async def _check_doctor_availability(doctor_name: str, date: str):
         doctor = result.scalars().first()
         if not doctor:
             return _err(f"Doctor '{doctor_name}' not found.")
-
-        day_of_week = target_date.weekday()  # 0=Mon
-        avail_result = await db.execute(
-            select(Availability).where(
-                and_(
-                    Availability.doctor_id == doctor.id,
-                    Availability.day_of_week == day_of_week,
-                    Availability.is_available == True,
-                )
-            )
-        )
-        avail_rows = avail_result.scalars().all()
-        if not avail_rows:
-            return _ok({
-                "doctor_id": doctor.id,
-                "doctor_name": doctor.name,
-                "date": str(target_date),
-                "available_slots": [],
-                "message": f"Dr. {doctor.name} is not available on {target_date.strftime('%A, %d %b %Y')}.",
-            })
-
-        # Get existing bookings
-        start_of_day = datetime.combine(target_date, datetime.min.time())
-        end_of_day = datetime.combine(target_date, datetime.max.time())
-        booked_result = await db.execute(
-            select(Appointment.start_time).where(
-                and_(
-                    Appointment.doctor_id == doctor.id,
-                    Appointment.start_time >= start_of_day,
-                    Appointment.start_time <= end_of_day,
-                    Appointment.status != AppointmentStatus.CANCELLED,
-                )
-            )
-        )
-        booked_starts = {row[0].replace(second=0, microsecond=0) for row in booked_result.all()}
-
-        all_slots = []
-        for row in avail_rows:
-            slots = _generate_slots(
-                row.start_time,
-                row.end_time,
-                row.slot_duration_minutes,
-                booked_starts,
-                target_date,
-            )
-            all_slots.extend(slots)
-
-        return _ok({
-            "doctor_id": doctor.id,
-            "doctor_name": doctor.name,
-            "specialization": doctor.specialization,
-            "date": str(target_date),
-            "available_slots": all_slots,
-        })
+        return _ok(await _availability_payload_for_doctor(doctor, target_date))
 
 
 async def _book_appointment(
@@ -320,6 +330,7 @@ async def _send_email_confirmation(
     appointment_details = {
         "doctor_name": doctor_name,
         "appointment_datetime": appointment_datetime,
+        "start_time": appointment_datetime,
     }
     try:
         svc = EmailService()
@@ -440,17 +451,17 @@ async def _auto_reschedule(
     except ValueError:
         return _err("Invalid date format. Use YYYY-MM-DD.")
 
+    async with AsyncSessionLocal() as db:
+        doctor = await db.get(Doctor, doctor_id)
+        if not doctor:
+            return _err(f"Doctor ID {doctor_id} not found.")
+
     suggestions = []
     # Check the preferred date and the 3 following days
     for delta in range(0, 4):
         check_date = pref_date + timedelta(days=delta)
-        result = await _check_doctor_availability(
-            doctor_name=str(doctor_id),  # will refetch by id
-            date=str(check_date),
-        )
-        # parse result
-        content = json.loads(result[0].text)
-        if isinstance(content, dict) and content.get("available_slots"):
+        content = await _availability_payload_for_doctor(doctor, check_date)
+        if content.get("available_slots"):
             slots = content["available_slots"][:3]  # top 3 per day
             for slot in slots:
                 suggestions.append({
