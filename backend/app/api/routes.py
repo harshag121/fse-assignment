@@ -1,4 +1,6 @@
 """All FastAPI routes."""
+import json
+import re
 import uuid
 from datetime import timedelta
 
@@ -26,9 +28,98 @@ from app.models.schemas import (
     ReportRequest,
 )
 from app.services.llm_service import LLMService
+from app.mcp_server.tools import _query_appointments_stats, _send_doctor_notification
 
 router = APIRouter()
 llm_service = LLMService()
+
+
+def _parse_report_query(query: str) -> tuple[dict, str | None, bool, str | None]:
+    lowered = query.lower()
+    params: dict[str, str] = {"date_range": "today"}
+
+    exact_date = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", query)
+    if exact_date:
+        params["date_range"] = "custom"
+        params["start_date"] = exact_date.group(1)
+        params["end_date"] = exact_date.group(1)
+    elif "yesterday" in lowered:
+        params["date_range"] = "yesterday"
+    elif "tomorrow" in lowered:
+        params["date_range"] = "tomorrow"
+    elif "last week" in lowered:
+        params["date_range"] = "last_week"
+    elif "this week" in lowered:
+        params["date_range"] = "this_week"
+
+    symptom_filter = None
+    for pattern in (
+        r"patients?\s+with\s+([a-zA-Z][a-zA-Z\s-]+)",
+        r"appointments?\s+with\s+([a-zA-Z][a-zA-Z\s-]+)",
+        r"with\s+([a-zA-Z][a-zA-Z\s-]+)",
+    ):
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        candidate = match.group(1).strip(" ?!.,")
+        for stop_word in (
+            " today",
+            " yesterday",
+            " tomorrow",
+            " this week",
+            " last week",
+            " on ",
+            " send ",
+            " notify ",
+            " do i have",
+            " do we have",
+            " are there",
+            " visited",
+        ):
+            if stop_word in candidate:
+                candidate = candidate.split(stop_word, 1)[0].strip()
+        if candidate:
+            candidate = " ".join(candidate.split()[:3])
+            symptom_filter = candidate
+            params["filter"] = candidate
+            break
+
+    should_notify = any(word in lowered for word in ("send", "notify", "slack", "whatsapp"))
+
+    channel = None
+    slack_match = re.search(r"(#[-\w]+)", query)
+    if slack_match:
+        channel = slack_match.group(1)
+    else:
+        phone_match = re.search(r"(whatsapp:\+\d{7,}|\+\d{7,})", query)
+        if phone_match:
+            channel = phone_match.group(1)
+
+    return params, symptom_filter, should_notify, channel
+
+
+def _build_report_summary(stats: dict, symptom_filter: str | None = None) -> str:
+    lines = [
+        f"Doctor report for {stats['date_range']}:",
+        f"- Total appointments: {stats['total_appointments']}",
+        f"- Confirmed: {stats['confirmed']}",
+        f"- Completed: {stats['completed']}",
+        f"- Cancelled: {stats['cancelled']}",
+        f"- Pending: {stats['pending']}",
+    ]
+    if stats.get("busiest_day"):
+        lines.append(f"- Busiest day: {stats['busiest_day']}")
+
+    symptom_breakdown = stats.get("symptom_breakdown") or {}
+    if symptom_filter:
+        lines.append(f"- Patients matching '{symptom_filter}': {stats['total_appointments']}")
+    elif symptom_breakdown:
+        top_symptoms = ", ".join(
+            f"{name} ({count})" for name, count in list(symptom_breakdown.items())[:3]
+        )
+        lines.append(f"- Top symptoms: {top_symptoms}")
+
+    return "\n".join(lines)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -190,10 +281,11 @@ async def chat(
     user_id = payload.user_id or (int(current_user["sub"]) if current_user else None)
 
     # Inject user identity so the LLM can pass the correct ID to tools
+    enriched_message = payload.message
     if user_id and payload.role == "patient":
-        enriched_message = f"[My patient_id is {user_id}] {payload.message}"
-    else:
-        enriched_message = payload.message
+        enriched_message = f"[My patient_id is {user_id}] {enriched_message}"
+    elif user_id and payload.role == "doctor":
+        enriched_message = f"[My doctor_id is {user_id}] {enriched_message}"
 
     try:
         result = await llm_service.chat(
@@ -242,15 +334,54 @@ async def get_chat_history(session_id: str, db: AsyncSession = Depends(get_db)):
 async def generate_report(payload: ReportRequest):
     """Natural-language report query for a doctor."""
     session_id = payload.session_id or str(uuid.uuid4())
-    # Prefix doctor_id so the model knows which ID to pass to query_appointments_stats
-    enriched_query = f"[My doctor_id is {payload.doctor_id}] {payload.query}"
+    await llm_service._save_message(session_id, payload.doctor_id, "user", payload.query)
+    report_args, symptom_filter, should_notify, channel = _parse_report_query(payload.query)
     try:
-        result = await llm_service.chat(
-            session_id=session_id,
-            user_message=enriched_query,
-            role="doctor",
-            user_id=payload.doctor_id,
+        stats_result = await _query_appointments_stats(
+            doctor_id=payload.doctor_id,
+            **report_args,
         )
+        stats_payload = json.loads(stats_result[0].text)
+        await llm_service._save_message(
+            session_id,
+            payload.doctor_id,
+            "tool",
+            stats_result[0].text,
+            tool_calls=[{"name": "query_appointments_stats", "args": {"doctor_id": payload.doctor_id, **report_args}}],
+        )
+        if stats_payload.get("error"):
+            raise RuntimeError(stats_payload["error"])
+
+        tools_called = ["query_appointments_stats"]
+        reply = _build_report_summary(stats_payload, symptom_filter)
+
+        if should_notify:
+            notification_result = await _send_doctor_notification(
+                doctor_id=payload.doctor_id,
+                message=reply,
+                channel=channel,
+            )
+            notification_payload = json.loads(notification_result[0].text)
+            await llm_service._save_message(
+                session_id,
+                payload.doctor_id,
+                "tool",
+                notification_result[0].text,
+                tool_calls=[{
+                    "name": "send_doctor_notification",
+                    "args": {
+                        "doctor_id": payload.doctor_id,
+                        "message": reply,
+                        "channel": channel,
+                    },
+                }],
+            )
+            if notification_payload.get("error"):
+                raise RuntimeError(notification_payload["error"])
+            tools_called.append("send_doctor_notification")
+            method = notification_payload.get("method", "notification")
+            target = notification_payload.get("channel") or channel or "configured channel"
+            reply = f"{reply}\n\nReport sent via {method} to {target}."
     except Exception as e:
         err = str(e)
         if "rate_limit" in err.lower():
@@ -258,4 +389,10 @@ async def generate_report(payload: ReportRequest):
         else:
             detail = f"AI service error: {err}"
         raise HTTPException(status_code=503, detail=detail)
-    return {"session_id": session_id, **result}
+    await llm_service._save_message(session_id, payload.doctor_id, "assistant", reply)
+    return {
+        "session_id": session_id,
+        "reply": reply,
+        "tool_calls_made": tools_called,
+        "appointments_affected": [],
+    }

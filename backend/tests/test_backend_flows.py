@@ -25,6 +25,7 @@ from app.models.database import (
     engine,
 )
 from app.mcp_server.tools import (
+    _ok,
     _auto_reschedule,
     _invoke_tool_handler,
     _query_appointments_stats,
@@ -175,6 +176,29 @@ class BackendFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["status"], "cancelled")
         self.assertEqual(payload["doctor"]["id"], self.primary_id)
         self.assertEqual(payload["patient"]["id"], self.patient_id)
+
+    async def test_generate_report_uses_direct_stats_and_notification_flow(self):
+        transport = ASGITransport(app=app)
+
+        async def fake_notify(**_kwargs):
+            return _ok({"status": "sent", "channel": "#doctor-reports", "method": "slack"})
+
+        with mock.patch("app.api.routes._send_doctor_notification", side_effect=fake_notify):
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.post(
+                    "/api/reports/generate",
+                    json={
+                        "doctor_id": self.primary_id,
+                        "query": "How many patients with fever do I have on 2026-03-18? Send it to #doctor-reports.",
+                        "session_id": "report-test-session",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["tool_calls_made"], ["query_appointments_stats", "send_doctor_notification"])
+        self.assertIn("Doctor report for 2026-03-18 to 2026-03-18", payload["reply"])
+        self.assertIn("Report sent via slack", payload["reply"])
 
 
 class EmailServiceTests(unittest.TestCase):
